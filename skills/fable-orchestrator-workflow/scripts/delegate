@@ -1,0 +1,1072 @@
+#!/usr/bin/env python3
+"""delegate - bridge between Claude Code (Opus reviewer, Fable architect) and the typist.
+
+Two typists. The default is the OpenCode worker: agent `eng-implementer` on
+lithosai/deepseek-ai/DeepSeek-V4.1-Flash#max. There is no fallback model: if that
+model cannot be reached, or a round turns out to have been served by anything else,
+this script fails loudly. With `start --typist opus` the typist is a Claude Code
+subagent (`opus-typist`) that the driver calls itself: `start` and `fix` then only
+open a round, and `delegate round` closes it.
+
+Everything the orchestrator reviews is produced here (diff, commit, test exit code),
+not taken from the typist's own report.
+
+Commands (run from inside the project's git repository):
+  delegate check
+  delegate prep <task>                      planning folder + dossier template
+  delegate start <task> --spec FILE [--typist deepseek|opus] [--tests DIR] [--plan FILE] [--signoff]
+                        [--base REF] [--timeout MIN]
+  delegate fix <task> --feedback FILE [--timeout MIN]
+  delegate round <task>                     close a round typed by the opus-typist subagent
+  delegate takeover <task> --reason TEXT    the driver takes the task over from the typist
+  delegate verify <task> [--allow-test-changes] [--timeout MIN] -- <test command...>
+  delegate package <task>                   sign-off package for the architect
+  delegate signoff <task> --verdict ACCEPT|CHANGES --file FILE
+  delegate integrate <task>
+  delegate status [<task>]
+  delegate stats                            all tasks, all repositories, with token usage by seat
+  delegate cleanup <task> [--force]
+
+Stdlib only. State lives in ~/.local/state/eng-orch, worktrees in ~/.local/share/eng-orch.
+"""
+import argparse
+import datetime
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+PROVIDER = "lithosai"
+MODEL_ID = "deepseek-ai/DeepSeek-V4.1-Flash"
+VARIANT = "max"
+MODEL = f"{PROVIDER}/{MODEL_ID}#{VARIANT}"
+AGENT = "eng-implementer"
+OPT_OUT_MARKER = ".no-delegate"
+
+# Claude Code subagent types, by the seat their tokens are counted under in `stats`.
+JUDGE_AGENTS = {"fable-architect", "fable-signoff", "fable-judge"}
+TYPIST_AGENTS = {"opus-typist"}
+SEATS = ("driver", "judge", "typist", "helpers")
+
+MAX_ROUNDS = int(os.environ.get("ENG_ORCH_MAX_ROUNDS", "6"))
+DEFAULT_TIMEOUT_MIN = int(os.environ.get("ENG_ORCH_TIMEOUT_MIN", "45"))
+MAX_BRIEF_BYTES = 100_000  # one argv entry is capped near 128 KiB on Linux
+REPORT_PRINT_CHARS = 1500     # fallback when the report has no recognisable sections
+DIGEST_SECTIONS = ("tests run", "deviations", "blockers")
+DIFF_WARN_LINES = 4000
+TEMPLATE_DIR = Path(__file__).resolve().parent.parent / "templates"
+
+STATE_ROOT = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "eng-orch"
+WT_ROOT = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "eng-orch" / "wt"
+
+WORKER_CONTRACT = """\
+You are the implementation worker. An architect wrote the brief below and will
+independently review your diff and run the tests; your report is not the acceptance.
+
+Rules:
+- Work only inside the current directory. It is a git worktree on your own task branch.
+- Implement exactly what the brief says. Use the exact names, paths and signatures it
+  gives. Do not widen the scope, redesign, or "improve" things it does not mention.
+- Follow the conventions already in this codebase.
+- Acceptance tests may already be in this worktree (the brief names them). Make them
+  pass without changing them. If one of them is wrong, say so under BLOCKERS.
+- Write or update the automated tests the brief asks for, run them, and report the
+  real outcome. Never weaken, skip or delete a test to make it pass.
+- Long-running commands: run them in the foreground with their own timeout; do not
+  leave background processes behind.
+- You may commit on this branch. Do not push, merge, switch branches, or touch git
+  configuration.
+- If the brief is wrong, contradictory or impossible, STOP and say so under BLOCKERS
+  instead of improvising.
+
+Finish with exactly this report:
+
+## REPORT
+### Changed files
+### What was implemented
+### Tests run (exact command and actual result)
+### Deviations from the brief
+### Blockers
+"""
+
+
+class Fail(Exception):
+    pass
+
+
+def report_digest(report):
+    """Only the parts of the worker's report the reviewer needs; the full text stays on disk."""
+    keep, cur = [], None
+    for line in report.splitlines():
+        if line.startswith("### "):
+            cur = line[4:].strip().lower()
+        if cur and any(cur.startswith(sec) for sec in DIGEST_SECTIONS):
+            keep.append(line)
+    text = "\n".join(keep).strip()
+    return text if text else report[:REPORT_PRINT_CHARS]
+
+
+def env_in(cwd):
+    """OpenCode takes its project directory from $PWD, which a plain cwd= does not update."""
+    return dict(os.environ, PWD=str(cwd)) if cwd else None
+
+
+def run(cmd, cwd=None, check=True, timeout=None):
+    p = subprocess.run(cmd, cwd=cwd, text=True, capture_output=True, timeout=timeout, env=env_in(cwd))
+    if check and p.returncode != 0:
+        raise Fail(f"command failed ({p.returncode}): {shlex.join(cmd)}\n{p.stderr.strip() or p.stdout.strip()}")
+    return p
+
+
+def git(args, cwd, check=True):
+    return run(["git", *args], cwd=cwd, check=check)
+
+
+def now():
+    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def ident(wt):
+    """A commit identity for the worktree when git has none configured."""
+    if git(["config", "user.email"], wt, check=False).returncode != 0:
+        return ["-c", "user.name=eng-orch worker", "-c", "user.email=eng-orch@localhost"]
+    return []
+
+
+def seed_tests(src: Path, wt: Path, task):
+    """Put the driver's acceptance tests into the worktree, committed, before the worker starts."""
+    rel = sorted(str(p.relative_to(src)) for p in src.rglob("*") if p.is_file())
+    if not rel:
+        raise Fail(f"{src} holds no files. Put the acceptance tests there at their repository-relative paths.")
+    for r in rel:
+        dest = wt / r
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src / r, dest)
+    git(["add", "--", *rel], wt)
+    if not git(["status", "--porcelain"], wt).stdout.strip():
+        raise Fail(f"the files in {src} are already in the repository unchanged: they test nothing new.")
+    git([*ident(wt), "commit", "-q", "--no-verify", "-m", f"eng-orch({task}): acceptance tests"], wt)
+    return dict(commit=git(["rev-parse", "HEAD"], wt).stdout.strip(), files=rel)
+
+
+def repo_root():
+    p = run(["git", "rev-parse", "--show-toplevel"], check=False)
+    if p.returncode != 0:
+        raise Fail(
+            "not inside a git repository. Delegation needs git (worktree, diff, gate).\n"
+            "Either implement this task directly, or ask the user before running `git init`."
+        )
+    # If we are inside a linked worktree, resolve to the main checkout.
+    common = run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"]).stdout.strip()
+    main = Path(common).parent if Path(common).name == ".git" else Path(p.stdout.strip())
+    return main.resolve()
+
+
+def repo_key(root: Path):
+    return f"{root.name}-{hashlib.sha256(str(root).encode()).hexdigest()[:6]}"
+
+
+def task_name(s):
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,48}", s):
+        raise Fail("task name must be lowercase letters, digits, dot, dash or underscore (max 49 chars)")
+    return s
+
+
+def state_dir(root: Path, task):
+    return STATE_ROOT / repo_key(root) / task
+
+
+def load_state(root, task):
+    f = state_dir(root, task) / "state.json"
+    if not f.exists():
+        raise Fail(f"no delegated task '{task}' for {root}. See `delegate status`.")
+    return json.loads(f.read_text())
+
+
+def save_state(st):
+    d = Path(st["state_dir"])
+    d.mkdir(parents=True, exist_ok=True)
+    tmp = d / "state.json.tmp"
+    tmp.write_text(json.dumps(st, indent=2))
+    tmp.replace(d / "state.json")
+
+
+def pid_alive(pid):
+    """Portable liveness check (no /proc, so it also works on macOS)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+class Lock:
+    """One round at a time per task: two writers in one worktree is the failure to prevent."""
+
+    def __init__(self, d: Path):
+        self.f = d / "lock"
+
+    def __enter__(self):
+        self.f.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            fd = os.open(self.f, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            pid = self.f.read_text().strip()
+            if pid.isdigit() and pid_alive(int(pid)):
+                raise Fail(f"task is busy: a round is already running (pid {pid}).")
+            self.f.unlink()
+            fd = os.open(self.f, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+        return self
+
+    def __exit__(self, *a):
+        self.f.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------- preflight
+
+def preflight(verbose=False):
+    if not shutil.which("opencode"):
+        raise Fail("opencode is not on PATH.")
+    models = run(["opencode", "models"], timeout=120).stdout.split()
+    if f"{PROVIDER}/{MODEL_ID}" not in models:
+        raise Fail(
+            f"model {PROVIDER}/{MODEL_ID} is not offered by OpenCode on this machine.\n"
+            "No substitute will be used. Fix the LithosAI provider in ~/.config/opencode/opencode.json."
+        )
+    agents = json.loads(run(["opencode", "debug", "agents"], timeout=120).stdout)
+    a = next((x for x in agents if x.get("id") == AGENT), None)
+    if not a:
+        raise Fail(f"OpenCode agent '{AGENT}' is missing (~/.config/opencode/agents/{AGENT}.md).")
+    m = a.get("model") or {}
+    if (m.get("providerID"), m.get("id"), m.get("variant")) != (PROVIDER, MODEL_ID, VARIANT):
+        raise Fail(f"agent '{AGENT}' is configured for {m}, expected {MODEL}.")
+    if verbose:
+        ver = run(["opencode", "--version"]).stdout.strip()
+        print(f"ok  opencode      {ver}")
+        print(f"ok  model         {MODEL}")
+        print(f"ok  agent         {AGENT} ({len(a.get('permissions', []))} permission rules)")
+        auth = run(["opencode", "auth", "list"], check=False, timeout=60).stdout
+        has = any("lithos" in line.lower() for line in auth.splitlines())
+        print(f"{'ok ' if has else 'NO '} credentials   LithosAI {'stored' if has else 'NOT FOUND (opencode auth login)'}")
+        if not has:
+            raise Fail("no LithosAI credential in OpenCode.")
+
+
+def session_record(session_id, cwd):
+    """(models that actually answered, directory the session ran in, token usage so far),
+    from OpenCode's own record."""
+    p = run(["opencode", "session", "export", session_id], cwd=cwd, check=False, timeout=120)
+    if p.returncode != 0:
+        return None, None, None
+    try:
+        data = json.loads(p.stdout)
+    except json.JSONDecodeError:
+        return None, None, None
+    info = data.get("info") or {}
+    where = (info.get("location") or {}).get("directory")
+    seen = set()
+    for msg in data.get("messages", []):
+        m = msg.get("model")
+        if isinstance(m, dict) and m.get("id"):
+            seen.add(f"{m.get('providerID')}/{m.get('id')}#{m.get('variant')}")
+    # OpenCode keeps one running total per session, and a task's rounds share one session.
+    t = info.get("tokens")
+    usage = None
+    if isinstance(t, dict):
+        cache = t.get("cache") or {}
+        usage = {"in": t.get("input") or 0, "cache_read": cache.get("read") or 0,
+                 "cache_write": cache.get("write") or 0,
+                 "out": (t.get("output") or 0) + (t.get("reasoning") or 0), "cost": info.get("cost")}
+    return seen, where, usage
+
+
+# ---------------------------------------------------------------- one worker round
+
+def worker_round(st, body, kind, timeout_min):
+    d = Path(st["state_dir"])
+    wt = st["worktree"]
+    n = st["rounds"] + 1
+    if n > MAX_ROUNDS:
+        raise Fail(
+            f"round limit reached ({MAX_ROUNDS}) for task '{st['task']}'. Do not keep looping:\n"
+            "reassess the design, find the underlying blocker, and report to the user."
+        )
+    brief = f"{WORKER_CONTRACT}\n---\n# {kind} (round {n}, task {st['task']})\n\n{body.strip()}\n"
+    if len(brief.encode()) > MAX_BRIEF_BYTES:
+        raise Fail(f"brief is {len(brief.encode())} bytes; keep it under {MAX_BRIEF_BYTES}. Split the task.")
+    (d / f"round-{n}.brief.md").write_text(brief)
+    events = d / f"round-{n}.events.jsonl"
+    errlog = d / f"round-{n}.stderr.log"
+
+    cmd = ["opencode", "run", "--agent", AGENT, "-m", MODEL, "--auto", "--format", "json",
+           "--title", f"eng-orch:{st['task']}"]
+    if st.get("session_id"):
+        cmd += ["--session", st["session_id"]]
+    cmd.append(brief)
+
+    head_before = git(["rev-parse", "HEAD"], wt).stdout.strip()
+    main_before = (git(["rev-parse", "HEAD"], st["repo"]).stdout, git(["status", "--porcelain"], st["repo"]).stdout)
+    timed_out = False
+    with open(events, "w") as out, open(errlog, "w") as err:
+        try:
+            rc = subprocess.run(cmd, cwd=wt, env=env_in(wt), stdout=out, stderr=err,
+                                timeout=timeout_min * 60).returncode
+        except subprocess.TimeoutExpired:
+            timed_out, rc = True, 124
+
+    session_id, texts, last_msg, errors = st.get("session_id"), {}, None, []
+    for line in events.read_text().splitlines():
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        session_id = session_id or ev.get("sessionID")
+        part = ev.get("part") or {}
+        if ev.get("type") == "text" and part.get("text"):
+            last_msg = part.get("messageID")
+            texts.setdefault(last_msg, []).append(part["text"])
+        if ev.get("type") == "error":
+            errors.append(json.dumps(ev.get("error") or ev)[:600])
+    report = "\n".join(texts.get(last_msg, [])).strip()
+    (d / f"round-{n}.report.md").write_text(report + "\n")
+
+    # Capture whatever the worker left behind, so the diff is complete and reviewable.
+    committed = False
+    if git(["status", "--porcelain"], wt).stdout.strip():
+        git(["add", "-A"], wt)
+        git([*ident(wt), "commit", "-q", "--no-verify", "-m", f"eng-orch({st['task']}): worker round {n}"], wt)
+        committed = True
+    head_after = git(["rev-parse", "HEAD"], wt).stdout.strip()
+
+    st.update(session_id=session_id, rounds=n, updated=now())
+    st.setdefault("history", []).append(
+        {"round": n, "kind": kind, "exit": rc, "timed_out": timed_out, "head": head_after, "at": now()})
+    save_state(st)
+
+    served, ran_in, usage = session_record(session_id, wt) if session_id else (None, None, None)
+    if usage:
+        st["worker_usage"] = usage
+        save_state(st)
+    wrong = sorted(served - {MODEL}) if served else []
+    main_after = (git(["rev-parse", "HEAD"], st["repo"]).stdout, git(["status", "--porcelain"], st["repo"]).stdout)
+    escaped = main_after != main_before
+    misplaced = ran_in is not None and Path(ran_in).resolve() != Path(wt).resolve()
+
+    print(f"== worker round {n} ({kind}) for task '{st['task']}' ==")
+    print(f"worktree   {wt}")
+    print(f"branch     {st['branch']}   base {st['base'][:10]}")
+    print(f"session    {session_id}")
+    print(f"resume     cd {shlex.quote(wt)} && opencode -s {session_id}")
+    print(f"exit       {rc}{'  (TIMED OUT after %d min)' % timeout_min if timed_out else ''}")
+    print(f"served by  {', '.join(sorted(served)) if served else 'UNKNOWN (session export failed)'}")
+    print(f"ran in     {ran_in or 'UNKNOWN'}{'   <-- NOT THE WORKTREE' if misplaced else ''}")
+    print(f"rounds     {n}/{MAX_ROUNDS}")
+    print(f"changed    {'yes' if head_after != head_before else 'NO CHANGES this round'}"
+          f"{' (uncommitted work captured by this script)' if committed else ''}")
+    stat = git(["diff", "--stat", f"{st['base']}..HEAD"], wt).stdout.strip()
+    print("\n-- diff vs base (measured by this script) --")
+    print(stat or "(empty)")
+    print(f"\nfull diff:  git -C {shlex.quote(wt)} diff {st['base'][:10]}..HEAD")
+    if errors:
+        print("\n-- errors reported by OpenCode --")
+        print("\n".join(errors[:5]))
+    tail = errlog.read_text().strip()
+    if rc != 0 and tail:
+        print("\n-- stderr (tail) --")
+        print(tail[-1500:])
+    print("\n-- WORKER REPORT DIGEST (a claim, not evidence; verify it) --")
+    print(report_digest(report) if report else "(the worker produced no final report)")
+    print(f"full report: {d / f'round-{n}.report.md'}")
+    print(f"\nnext: review the diff, then `delegate verify {st['task']} -- <test command>`")
+
+    if misplaced or escaped:
+        raise Fail("ISOLATION BREACH: "
+                   + ("the session ran outside the task worktree. " if misplaced else "")
+                   + ("The main checkout changed during the round (HEAD or working tree). " if escaped else "")
+                   + "Inspect the main checkout before doing anything else, and tell the user.")
+    if wrong:
+        raise Fail(f"MODEL MISMATCH: this session was also served by {wrong}. Expected only {MODEL}. "
+                   "Treat this round as invalid and tell the user.")
+    if timed_out:
+        raise Fail("worker timed out. Its partial work is committed on the task branch; inspect it, "
+                   "then either `delegate fix` with a narrower instruction or report to the user.")
+    if rc != 0:
+        raise Fail(f"opencode exited {rc}. No fallback model is used. If the provider is down, stop and tell the user.")
+
+
+# ---------------------------------------------------------------- a round typed by a Claude subagent
+
+def open_round(st, body, kind):
+    """Write the brief and note the starting point; the driver then calls the opus-typist subagent."""
+    d = Path(st["state_dir"])
+    if st.get("open_round"):
+        raise Fail(f"round {st['open_round']['n']} is still open. Close it with `delegate round {st['task']}`.")
+    n = st["rounds"] + 1
+    if n > MAX_ROUNDS:
+        raise Fail(
+            f"round limit reached ({MAX_ROUNDS}) for task '{st['task']}'. Do not keep looping:\n"
+            "reassess the design, find the underlying blocker, and report to the user."
+        )
+    brief, report = d / f"round-{n}.brief.md", d / f"round-{n}.report.md"
+    brief.write_text(f"{WORKER_CONTRACT}\n---\n# {kind} (round {n}, task {st['task']})\n\n{body.strip()}\n")
+    st.update(open_round=dict(
+        n=n, kind=kind, at=now(), head=git(["rev-parse", "HEAD"], st["worktree"]).stdout.strip(),
+        main=[git(["rev-parse", "HEAD"], st["repo"]).stdout, git(["status", "--porcelain"], st["repo"]).stdout]),
+        updated=now())
+    save_state(st)
+    print(f"== round {n} ({kind}) for task '{st['task']}' is open for the Opus typist ==")
+    print("call the `opus-typist` subagent with this prompt and nothing else:\n")
+    print(f"    Worktree: {st['worktree']}")
+    print(f"    Brief: {brief}")
+    print(f"    Report: {report}")
+    print(f"\nwhen it has finished: delegate round {st['task']}")
+
+
+def cmd_round(a):
+    root = repo_root()
+    st = load_state(root, task_name(a.task))
+    opened = st.get("open_round")
+    if not opened:
+        raise Fail("no round is open. `delegate start --typist opus` and `delegate fix` open one.")
+    d, wt, n = Path(st["state_dir"]), st["worktree"], opened["n"]
+    with Lock(d):
+        committed = False
+        if git(["status", "--porcelain"], wt).stdout.strip():
+            git(["add", "-A"], wt)
+            git([*ident(wt), "commit", "-q", "--no-verify", "-m", f"eng-orch({st['task']}): typist round {n}"], wt)
+            committed = True
+        head = git(["rev-parse", "HEAD"], wt).stdout.strip()
+        del st["open_round"]
+        st.update(rounds=n, updated=now())
+        st.setdefault("history", []).append(
+            {"round": n, "kind": opened["kind"], "exit": 0, "timed_out": False, "head": head, "at": now()})
+        save_state(st)
+    report = d / f"round-{n}.report.md"
+    text = report.read_text().strip() if report.exists() else ""
+    if not text:
+        report.write_text("(the typist wrote no report)\n")
+    escaped = [git(["rev-parse", "HEAD"], st["repo"]).stdout,
+               git(["status", "--porcelain"], st["repo"]).stdout] != opened["main"]
+    print(f"== typist round {n} ({opened['kind']}) for task '{st['task']}' ==")
+    print(f"worktree   {wt}")
+    print(f"branch     {st['branch']}   base {st['base'][:10]}")
+    print(f"rounds     {n}/{MAX_ROUNDS}")
+    print(f"changed    {'yes' if head != opened['head'] else 'NO CHANGES this round'}"
+          f"{' (uncommitted work captured by this script)' if committed else ''}")
+    print("\n-- diff vs base (measured by this script) --")
+    print(git(["diff", "--stat", f"{st['base']}..HEAD"], wt).stdout.strip() or "(empty)")
+    print(f"\nfull diff:  git -C {shlex.quote(wt)} diff {st['base'][:10]}..HEAD")
+    print("\n-- TYPIST REPORT DIGEST (a claim, not evidence; verify it) --")
+    print(report_digest(text) if text else "(the typist wrote no report)")
+    print(f"full report: {report}")
+    print(f"\nnext: review the diff, then `delegate verify {st['task']} -- <test command>`")
+    if escaped:
+        raise Fail("ISOLATION BREACH: the main checkout changed while the round was open (HEAD or working "
+                   "tree). Inspect the main checkout before doing anything else, and tell the user.")
+
+
+# ---------------------------------------------------------------- token usage
+
+def note_session(a):
+    """Remember which Claude Code session worked on a task, so `stats` can read its token usage."""
+    sid, task = os.environ.get("CLAUDE_CODE_SESSION_ID"), getattr(a, "task", None)
+    if not sid or not task or a.cmd in ("status", "cleanup"):   # housekeeping is not work on the task
+        return
+    try:
+        d = state_dir(repo_root(), task_name(task))
+    except Fail:
+        return
+    if not d.is_dir():
+        return
+    f = d / "sessions.json"
+    try:
+        data = json.loads(f.read_text())
+    except (OSError, ValueError):
+        data = {}
+    config = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+    data.setdefault(sid, {"projects": str(config / "projects"), "first": now()})["last"] = now()
+    f.write_text(json.dumps(data, indent=2))
+
+
+def parse_time(s):
+    try:
+        return datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        return None
+
+
+def transcript_usage(path, start, end):
+    """Tokens in one Claude Code transcript between two times. A message is logged once per
+    content block with the same usage, so count each message id once."""
+    seen = {}
+    try:
+        with open(path) as fh:
+            for line in fh:
+                try:
+                    o = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                m = o.get("message") if isinstance(o, dict) else None
+                if not isinstance(m, dict) or o.get("type") != "assistant" or not isinstance(m.get("usage"), dict):
+                    continue
+                at = parse_time(o.get("timestamp"))
+                if at is None or (start and at <= start) or (end and at > end):
+                    continue
+                seen[m.get("id") or o.get("uuid")] = m["usage"]
+    except OSError:
+        return None
+    return {"in": sum(u.get("input_tokens") or 0 for u in seen.values()),
+            "cache_read": sum(u.get("cache_read_input_tokens") or 0 for u in seen.values()),
+            "cache_write": sum(u.get("cache_creation_input_tokens") or 0 for u in seen.values()),
+            "out": sum(u.get("output_tokens") or 0 for u in seen.values())}
+
+
+def add_usage(total, seat, usage):
+    if usage:
+        t = total.setdefault(seat, {"in": 0, "cache_read": 0, "cache_write": 0, "out": 0})
+        for k in t:
+            t[k] += usage.get(k) or 0
+
+
+def claude_usage(sid, projects, start, end):
+    """{seat: usage} for one Claude Code session: the main thread is the driver, subagents go by type."""
+    total = {}
+    for main in Path(projects).glob(f"*/{sid}.jsonl"):
+        add_usage(total, "driver", transcript_usage(main, start, end))
+        for sub in (main.with_suffix("") / "subagents").glob("agent-*.jsonl"):
+            try:
+                kind = json.loads(sub.with_name(sub.stem + ".meta.json").read_text()).get("agentType")
+            except (OSError, ValueError):
+                kind = None
+            seat = "judge" if kind in JUDGE_AGENTS else "typist" if kind in TYPIST_AGENTS else "helpers"
+            add_usage(total, seat, transcript_usage(sub, start, end))
+    return total
+
+
+def task_usage(tasks):
+    """{task dir: {seat: usage}}. A session's tokens go to a task from the session's start, or from the
+    previous task's last command in that session, up to this task's last command, so nothing counts twice."""
+    by_session = {}
+    for d in tasks:
+        try:
+            sessions = json.loads((d / "sessions.json").read_text())
+        except (OSError, ValueError):
+            continue
+        for sid, rec in sessions.items():
+            last = parse_time(rec.get("last"))
+            if last:
+                by_session.setdefault((sid, rec.get("projects")), []).append((last, d))
+    out = {}
+    for (sid, projects), uses in by_session.items():
+        start = None
+        for last, d in sorted(uses, key=lambda u: u[0]):
+            for seat, usage in claude_usage(sid, projects, start, last).items():
+                add_usage(out.setdefault(d, {}), seat, usage)
+            start = last
+    return out
+
+
+def tokens(n):
+    return f"{n / 1e6:.2f}M" if n >= 1e6 else f"{n / 1e3:.1f}k" if n >= 1e3 else str(n)
+
+
+def read_written(u):
+    """Tokens read (every turn's whole context, cached or not) and tokens written."""
+    return (u["in"] + u["cache_read"] + u["cache_write"], u["out"]) if u else (0, 0)
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_check(a):
+    preflight(verbose=True)
+    print("preflight passed")
+
+
+def cmd_start(a):
+    root = repo_root()
+    task = task_name(a.task)
+    worker = a.typist == "deepseek"
+    if worker and (root / OPT_OUT_MARKER).exists():
+        raise Fail(f"{root} contains {OPT_OUT_MARKER}: this repository's code must not be sent to the "
+                   "worker's provider. Implement directly.")
+    spec = Path(a.spec).read_text()
+    if not spec.strip():
+        raise Fail("spec file is empty.")
+    if a.plan and (not Path(a.plan).is_file() or not Path(a.plan).read_text().strip()):
+        raise Fail(f"plan file {a.plan} is missing or empty.")
+    if a.tests and not Path(a.tests).is_dir():
+        raise Fail(f"tests directory {a.tests} does not exist.")
+    d = state_dir(root, task)
+    if (d / "state.json").exists():
+        raise Fail(f"task '{task}' already exists. Use `delegate fix {task}` or pick another name.")
+    if worker:
+        preflight()
+    base = git(["rev-parse", "--verify", f"{a.base}^{{commit}}"], root, check=False)
+    if base.returncode != 0:
+        raise Fail(f"cannot resolve base '{a.base}'. The repository needs at least one commit.")
+    base = base.stdout.strip()
+    branch = f"eng/{task}"
+    if git(["rev-parse", "--verify", "-q", f"refs/heads/{branch}"], root, check=False).returncode == 0:
+        raise Fail(f"branch {branch} already exists. Pick another task name.")
+    wt = WT_ROOT / repo_key(root) / task
+    if wt.exists():
+        raise Fail(f"{wt} already exists.")
+    wt.parent.mkdir(parents=True, exist_ok=True)
+    dirty = git(["status", "--porcelain"], root).stdout.strip()
+    git(["worktree", "add", "-q", "-b", branch, str(wt), base], root)
+    tests = None
+    if a.tests:
+        try:
+            tests = seed_tests(Path(a.tests).resolve(), wt, task)
+        except Fail:
+            git(["worktree", "remove", "--force", str(wt)], root, check=False)
+            git(["branch", "-D", branch], root, check=False)
+            raise
+    d.mkdir(parents=True, exist_ok=True)
+    designer = "opus"
+    if a.plan:
+        src = Path(a.plan).resolve()
+        if src != (d / "plan.md").resolve():
+            shutil.copyfile(src, d / "plan.md")
+        designer = "fable"
+    st = dict(task=task, repo=str(root), worktree=str(wt), branch=branch, base=base,
+              origin_branch=git(["rev-parse", "--abbrev-ref", "HEAD"], root).stdout.strip(),
+              state_dir=str(d), session_id=None, rounds=0, created=now(), integrated=False,
+              designer=designer, signoff_required=bool(a.plan or a.signoff), tests=tests, typist=a.typist)
+    save_state(st)
+    if tests:
+        print(f"seeded {len(tests['files'])} acceptance test file(s) at {tests['commit'][:10]}; "
+              "`delegate verify` refuses if they change.\n")
+    if dirty:
+        print("note: the main checkout has uncommitted changes; the worker starts from the commit "
+              f"{base[:10]} and will NOT see them.\n")
+    with Lock(d):
+        if worker:
+            worker_round(st, spec, "IMPLEMENTATION BRIEF", a.timeout)
+        else:
+            open_round(st, spec, "IMPLEMENTATION BRIEF")
+
+
+def cmd_fix(a):
+    root = repo_root()
+    st = load_state(root, task_name(a.task))
+    if st.get("integrated"):
+        raise Fail("task is already integrated. Start a new task for follow-up work.")
+    if st.get("takeover"):
+        raise Fail("the driver took this task over; the worker is not used on it again. "
+                   "Edit and commit in the worktree, then `delegate verify`.")
+    fb = Path(a.feedback).read_text()
+    if not fb.strip():
+        raise Fail("feedback file is empty.")
+    if st.get("typist") == "opus":
+        with Lock(Path(st["state_dir"])):
+            open_round(st, fb, "REVIEW FEEDBACK - corrections required")
+        return
+    preflight()
+    with Lock(Path(st["state_dir"])):
+        worker_round(st, fb, "REVIEW FEEDBACK - corrections required", a.timeout)
+
+
+def cmd_takeover(a):
+    root = repo_root()
+    st = load_state(root, task_name(a.task))
+    if st.get("integrated"):
+        raise Fail("task is already integrated.")
+    if st.get("takeover"):
+        raise Fail(f"already taken over after round {st['takeover']['round']}.")
+    if not a.reason.strip():
+        raise Fail("give the reason: what the worker failed to do.")
+    if st.get("open_round"):
+        raise Fail(f"round {st['open_round']['n']} is still open. Close it with `delegate round {st['task']}` first.")
+    with Lock(Path(st["state_dir"])):
+        st.update(takeover=dict(at=now(), round=st["rounds"], reason=a.reason.strip()), updated=now())
+        save_state(st)
+    print(f"task '{st['task']}' taken over after worker round {st['rounds']}. The worker is not used on it again.")
+    print(f"edit and commit in {st['worktree']}, then `delegate verify {st['task']} -- <test command>`")
+
+
+def cmd_verify(a):
+    root = repo_root()
+    st = load_state(root, task_name(a.task))
+    wt, d = st["worktree"], Path(st["state_dir"])
+    if not a.command:
+        raise Fail("give the test command after `--`, e.g. delegate verify mytask -- pytest -q")
+    if st.get("open_round"):
+        raise Fail(f"round {st['open_round']['n']} is still open. Close it with `delegate round {st['task']}` first.")
+    if git(["status", "--porcelain"], wt).stdout.strip():
+        raise Fail("the worktree has uncommitted changes. Evidence must be tied to a commit: "
+                   "commit or discard them in the worktree first.")
+    head = git(["rev-parse", "HEAD"], wt).stdout.strip()
+    seeded = st.get("tests")
+    tests_changed = git(["diff", "--name-only", seeded["commit"], "HEAD", "--", *seeded["files"]],
+                        wt).stdout.splitlines() if seeded else []
+    if tests_changed and not a.allow_test_changes:
+        raise Fail("GATE: acceptance tests changed after they were seeded:\n  " + "\n  ".join(tests_changed)
+                   + "\nIf the worker changed them, the round failed. If you corrected a wrong test "
+                     "yourself, re-run with --allow-test-changes and say so in the report.")
+    n = len(list(d.glob("evidence-*.json"))) + 1
+    diff = git(["diff", f"{st['base']}..HEAD"], wt).stdout
+    (d / f"evidence-{n}.diff").write_text(diff)
+    log = d / f"evidence-{n}.test.log"
+    timed_out = False
+    with open(log, "w") as out:
+        try:
+            rc = subprocess.run(a.command, cwd=wt, env=env_in(wt), stdout=out, stderr=subprocess.STDOUT,
+                                timeout=a.timeout * 60).returncode
+        except subprocess.TimeoutExpired:
+            timed_out, rc = True, 124
+        except FileNotFoundError as e:
+            out.write(f"{e}\n")
+            rc = 127
+    # The test run must not have changed tracked state either.
+    clean_after = not git(["status", "--porcelain"], wt).stdout.strip()
+    ev = dict(n=n, head=head, base=st["base"], command=a.command, exit=rc, timed_out=timed_out,
+              clean_after=clean_after, at=now(), round=st["rounds"], tests_changed=tests_changed)
+    (d / f"evidence-{n}.json").write_text(json.dumps(ev, indent=2))
+    print(f"== evidence {n} for task '{st['task']}' (worker round {st['rounds']}) ==")
+    print(f"commit   {head}")
+    if tests_changed:
+        print(f"note     acceptance tests changed since seeding (allowed): {', '.join(tests_changed)}")
+    print(f"command  {shlex.join(a.command)}")
+    print(f"exit     {rc}{'  (TIMED OUT)' if timed_out else ''}   -> {'PASS' if rc == 0 else 'FAIL'}")
+    if not clean_after:
+        print("note     the test run left untracked/modified files in the worktree (not part of the diff)")
+    print(f"log      {log}")
+    print(f"diff     {d / f'evidence-{n}.diff'}  ({len(diff.splitlines())} lines)")
+    print("\n-- test output (tail) --")
+    print(log.read_text()[-1500:].strip() or "(no output)")
+    print(f"(full log: {log})")
+    sys.exit(0 if rc == 0 else 1)
+
+
+def latest_evidence(d: Path):
+    files = sorted(d.glob("evidence-*.json"), key=lambda p: int(p.stem.split("-")[1]))
+    return json.loads(files[-1].read_text()) if files else None
+
+
+def cmd_integrate(a):
+    root = repo_root()
+    st = load_state(root, task_name(a.task))
+    wt, d = st["worktree"], Path(st["state_dir"])
+    if st.get("integrated"):
+        raise Fail("already integrated.")
+    ev = latest_evidence(d)
+    head = git(["rev-parse", "HEAD"], wt).stdout.strip()
+    # The gate. A worker report can never satisfy it; only a passing run of this script can.
+    if not ev:
+        raise Fail("GATE: no test evidence. Run `delegate verify <task> -- <test command>` first.")
+    if ev["head"] != head:
+        raise Fail(f"GATE: the latest evidence is for commit {ev['head'][:10]} but the branch is at "
+                   f"{head[:10]}. Re-run `delegate verify`.")
+    if ev["exit"] != 0:
+        raise Fail(f"GATE: the latest verification failed (exit {ev['exit']}). Not integrating.")
+    if git(["status", "--porcelain", "--untracked-files=no"], wt).stdout.strip():
+        raise Fail("GATE: the worktree has uncommitted tracked changes that were never verified.")
+    if st.get("signoff_required"):
+        so = latest_signoff(d)
+        if not so:
+            raise Fail("GATE: this task requires architect sign-off. Run `delegate package`, get the "
+                       "fable-signoff verdict, then `delegate signoff`.")
+        if so["head"] != head:
+            raise Fail(f"GATE: the sign-off is for commit {so['head'][:10]} but the branch is at {head[:10]}. "
+                       "Re-package and get a new sign-off.")
+        if so["verdict"] != "ACCEPT":
+            raise Fail("GATE: the latest sign-off verdict is CHANGES. Fix, verify, re-package, re-sign.")
+    cur = git(["rev-parse", "HEAD"], root).stdout.strip()
+    p = git(["merge", "--squash", st["branch"]], root, check=False)
+    if p.returncode != 0:
+        raise Fail("squash-merge into the main checkout failed (conflict or local changes in the way):\n"
+                   + (p.stderr.strip() or p.stdout.strip())
+                   + "\nResolve it yourself; nothing was committed.")
+    st.update(integrated=True, integrated_at=now(), integrated_onto=cur)
+    save_state(st)
+    print(f"integrated task '{st['task']}' into {root} as STAGED, UNCOMMITTED changes.")
+    print(git(["diff", "--cached", "--stat"], root).stdout.strip())
+    if cur != st["base"]:
+        print(f"\nWARNING: the main checkout moved since the task started ({st['base'][:10]} -> {cur[:10]}).\n"
+              "The evidence was gathered on the old base: re-run the tests here before accepting.")
+    print("\nCommit only if the user asked for commits. Then `delegate cleanup " + st["task"] + "`.")
+
+
+def latest_signoff(d: Path):
+    files = sorted(d.glob("signoff-*.json"), key=lambda p: int(p.stem.split("-")[1]))
+    return json.loads(files[-1].read_text()) if files else None
+
+
+def cmd_prep(a):
+    root = repo_root()
+    task = task_name(a.task)
+    d = state_dir(root, task)
+    if (d / "state.json").exists():
+        raise Fail(f"task '{task}' already started. Use another name.")
+    d.mkdir(parents=True, exist_ok=True)
+    dossier = d / "dossier.md"
+    tpl = TEMPLATE_DIR / "dossier.md"
+    if not dossier.exists():
+        if not tpl.exists():
+            raise Fail(f"dossier template missing: {tpl}")
+        shutil.copyfile(tpl, dossier)
+    for marker in (OPT_OUT_MARKER, ".no-fable"):
+        if (root / marker).exists():
+            print(f"note: {root} contains {marker}")
+    print(f"task dir   {d}")
+    print(f"dossier    {dossier}   (fill this in)")
+    print(f"plan       {d / 'plan.md'}       (architect writes)")
+    print(f"brief      {d / 'brief.md'}      (architect writes; goes to the worker)")
+    print(f"holdback   {d / 'holdback.md'}   (architect writes; never sent to the worker)")
+    print(f"tests      {d / 'tests'}/        (acceptance tests at repository-relative paths; `start --tests`)")
+
+
+def cmd_package(a):
+    root = repo_root()
+    st = load_state(root, task_name(a.task))
+    wt, d = st["worktree"], Path(st["state_dir"])
+    head = git(["rev-parse", "HEAD"], wt).stdout.strip()
+    ev = latest_evidence(d)
+    if not ev or ev["head"] != head or ev["exit"] != 0:
+        raise Fail("package only after a passing `delegate verify` on the current commit.")
+    diff = git(["diff", f"{st['base']}..HEAD"], wt).stdout
+    stat = git(["diff", "--stat", f"{st['base']}..HEAD"], wt).stdout.strip()
+    plan = (d / "plan.md").read_text() if (d / "plan.md").exists() else None
+    brief1 = d / "round-1.brief.md"
+    holdback = (d / "holdback.md").read_text() if (d / "holdback.md").exists() else None
+    reports = sorted(d.glob("round-*.report.md"), key=lambda p: int(p.stem.split(".")[0].split("-")[1]))
+    digest = report_digest(reports[-1].read_text()) if reports else "(no worker report)"
+    rounds = "\n".join(f"- round {h['round']}: {h['kind']}, exit {h['exit']}"
+                       f"{' (timed out)' if h.get('timed_out') else ''}" for h in st.get("history", []))
+    if st.get("takeover"):
+        rounds += (f"\n- after round {st['takeover']['round']}: the driver (Opus) took the task over from the "
+                   f"worker: {st['takeover']['reason']}")
+    if ev.get("tests_changed"):
+        rounds += "\n- acceptance tests changed after seeding: " + ", ".join(ev["tests_changed"])
+    n = len(list(d.glob("signoff-package-*.md"))) + 1
+    out = d / f"signoff-package-{n}.md"
+    parts = [
+        f"# Sign-off package: task {st['task']} (commit {head[:12]})",
+        "## 1. The plan",
+        plan if plan else "(no plan.md: Opus designed this task; the round-1 brief follows)\n\n"
+                         + (brief1.read_text() if brief1.exists() else "(missing)"),
+        "## 2. Held-back checks (never shown to the worker)",
+        holdback if holdback else "(none recorded)",
+        "## 3. Rounds",
+        rounds or "(none)",
+        "## 4. Verification evidence (measured by the script)",
+        f"command: {shlex.join(ev['command'])}\nexit: {ev['exit']}\ncommit: {ev['head']}",
+        "## 5. Worker's own account (claims, not evidence)",
+        digest,
+        "## 6. Diff stat",
+        stat or "(empty)",
+        "## 7. Full diff",
+        "```diff\n" + diff + "\n```",
+    ]
+    out.write_text("\n\n".join(parts) + "\n")
+    lines = len(diff.splitlines())
+    print(f"package    {out}")
+    print(f"diff       {lines} lines")
+    if lines > DIFF_WARN_LINES:
+        print(f"WARNING    diff exceeds {DIFF_WARN_LINES} lines: ask the architect to review the "
+              "risky files first and say what it did not read.")
+
+
+def cmd_signoff(a):
+    root = repo_root()
+    st = load_state(root, task_name(a.task))
+    wt, d = st["worktree"], Path(st["state_dir"])
+    verdict = a.verdict.upper()
+    if verdict not in ("ACCEPT", "CHANGES"):
+        raise Fail("verdict must be ACCEPT or CHANGES.")
+    text = Path(a.file).read_text()
+    if not text.strip():
+        raise Fail("sign-off file is empty.")
+    head = git(["rev-parse", "HEAD"], wt).stdout.strip()
+    n = len(list(d.glob("signoff-*.json"))) + 1
+    (d / f"signoff-{n}.md").write_text(text)
+    rec = dict(n=n, head=head, verdict=verdict, at=now(), round=st["rounds"])
+    (d / f"signoff-{n}.json").write_text(json.dumps(rec, indent=2))
+    print(f"recorded sign-off {n}: {verdict} for commit {head[:10]}")
+
+
+def cmd_stats(a):
+    rows = []
+    files = sorted(STATE_ROOT.glob("*/*/state.json"))
+    usage = task_usage([f.parent for f in files])
+    for f in files:
+        st = json.loads(f.read_text())
+        d = f.parent
+        evs = sorted((json.loads(p.read_text()) for p in d.glob("evidence-*.json")), key=lambda e: e["n"])
+        sos = [json.loads(p.read_text()) for p in d.glob("signoff-*.json")]
+        seats = usage.get(d, {})
+        add_usage(seats, "typist", st.get("worker_usage"))
+        rows.append(dict(repo=f.parent.parent.name, task=st["task"], designer=st.get("designer", "opus"),
+                         typist=st.get("typist", "deepseek"), seats=seats,
+                         rounds=st["rounds"], verifies=len(evs), failed=sum(e["exit"] != 0 for e in evs),
+                         first=None if not evs else evs[0]["exit"] == 0, takeover=bool(st.get("takeover")),
+                         signoffs=len(sos), changes=sum(s["verdict"] == "CHANGES" for s in sos),
+                         integrated=st.get("integrated", False)))
+    if not rows:
+        print("no tasks recorded yet")
+        return
+    print(f"{'repo':28} {'task':24} {'design':6} {'rnds':>4} {'vfy':>4} {'fail':>4} {'1st':>4} {'tko':>4} "
+          f"{'sign':>4} {'chg':>4}  int")
+    for r in rows:
+        first = "-" if r["first"] is None else "pass" if r["first"] else "fail"
+        print(f"{r['repo'][:28]:28} {r['task'][:24]:24} {r['designer']:6} {r['rounds']:>4} {r['verifies']:>4} "
+              f"{r['failed']:>4} {first:>4} {'yes' if r['takeover'] else 'no':>4} "
+              f"{r['signoffs']:>4} {r['changes']:>4}  {'yes' if r['integrated'] else 'no'}")
+    signed = [r for r in rows if r["signoffs"]]
+    print(f"\ntasks {len(rows)}, average worker rounds {sum(r['rounds'] for r in rows) / len(rows):.1f}")
+    verified = [r for r in rows if r["first"] is not None]
+    if verified:
+        ok = sum(1 for r in verified if r["first"])
+        print(f"passed the first verification: {ok} of {len(verified)} ({100 * ok / len(verified):.0f}%)")
+    taken = sum(1 for r in rows if r["takeover"])
+    print(f"taken over by the driver: {taken} of {len(rows)} ({100 * taken / len(rows):.0f}%)")
+    if signed:
+        caught = sum(1 for r in signed if r["changes"])
+        print(f"architect sign-offs on {len(signed)} tasks; {caught} returned CHANGES at least once "
+              f"({100 * caught / len(signed):.0f}%)")
+
+    print("\ntokens read / written, by seat (read counts each turn's whole context, cached or not)")
+    def cell(u):
+        return f"{' / '.join(tokens(n) for n in read_written(u)) if sum(read_written(u)) else '-':>17}"
+
+    print(f"{'repo':28} {'task':24} {'typed by':8} " + " ".join(f"{s:>17}" for s in SEATS))
+    total = {}
+    for r in rows:
+        for s in SEATS:
+            add_usage(total, s, r["seats"].get(s))
+        print(f"{r['repo'][:28]:28} {r['task'][:24]:24} {r['typist']:8} "
+              + " ".join(cell(r["seats"].get(s)) for s in SEATS))
+    grand = sum(sum(read_written(u)) for u in total.values())
+    if not grand:
+        print("no token usage recorded yet (it is collected from tasks run after 15 Nov 2026)")
+        return
+    print(f"{'all tasks':62} " + " ".join(cell(total.get(s)) for s in SEATS))
+    print(f"{'share of all tokens':62} " + " ".join(
+        f"{100 * sum(read_written(total.get(s))) / grand:>16.0f}%" for s in SEATS))
+    print("Claude tokens are read from the session transcripts: from the session's start (or the previous\n"
+          "task's last delegate command) to this task's last delegate command. The DeepSeek typist's\n"
+          "tokens are OpenCode's own total for the task's session.")
+
+
+def cmd_status(a):
+    root = repo_root()
+    base = STATE_ROOT / repo_key(root)
+    tasks = [a.task] if a.task else sorted(p.name for p in base.glob("*")
+                                         if (p / "state.json").exists() and ".done-" not in p.name)
+    if not tasks:
+        print(f"no delegated tasks for {root}")
+        return
+    for t in tasks:
+        st = load_state(root, t)
+        ev = latest_evidence(Path(st["state_dir"]))
+        exists = Path(st["worktree"]).exists()
+        head = git(["rev-parse", "HEAD"], st["worktree"]).stdout.strip() if exists else None
+        if not ev:
+            gate = "no evidence"
+        elif ev["head"] != head:
+            gate = "evidence is stale"
+        else:
+            gate = "PASS" if ev["exit"] == 0 else f"FAIL (exit {ev['exit']})"
+        so = latest_signoff(Path(st["state_dir"]))
+        if not st.get("signoff_required"):
+            sgate = "not required"
+        elif not so:
+            sgate = "required, none yet"
+        elif so["head"] != head:
+            sgate = "stale"
+        else:
+            sgate = so["verdict"]
+        print(f"{t}: designer {st.get('designer', 'opus')}, typist {st.get('typist', 'deepseek')}, "
+              f"rounds {st['rounds']}/{MAX_ROUNDS}"
+              f"{' (round %d open)' % st['open_round']['n'] if st.get('open_round') else ''}"
+              f"{' (taken over by the driver)' if st.get('takeover') else ''}, "
+              f"verification: {gate}, sign-off: {sgate}, integrated: {st.get('integrated', False)}, "
+              f"session {st.get('session_id')}")
+        print(f"   worktree {st['worktree']}{'' if exists else '  (removed)'}")
+        print(f"   state    {st['state_dir']}")
+
+
+def cmd_cleanup(a):
+    root = repo_root()
+    st = load_state(root, task_name(a.task))
+    if not st.get("integrated") and not a.force:
+        raise Fail("task was never integrated; its work would be lost. Pass --force only if the user "
+                   "agreed to discard it.")
+    if Path(st["worktree"]).exists():
+        git(["worktree", "remove", "--force", st["worktree"]], root)
+    git(["branch", "-D", st["branch"]], root, check=False)
+    archive = Path(st["state_dir"]).with_name(f"{st['task']}.done-{datetime.datetime.now():%Y%m%d-%H%M%S}")
+    Path(st["state_dir"]).rename(archive)
+    print(f"removed worktree and branch {st['branch']}; records kept in {archive}")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="delegate", description=__doc__.split("\n\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("check").set_defaults(fn=cmd_check)
+    s = sub.add_parser("prep"); s.add_argument("task"); s.set_defaults(fn=cmd_prep)
+    s = sub.add_parser("start")
+    s.add_argument("task"); s.add_argument("--spec", required=True)
+    s.add_argument("--typist", choices=("deepseek", "opus"), default="deepseek",
+                   help="deepseek: the OpenCode worker runs the round now (default). "
+                        "opus: open a round for the opus-typist subagent; close it with `delegate round`")
+    s.add_argument("--tests", help="directory of acceptance tests at repository-relative paths; "
+                                   "committed into the worktree before the worker starts")
+    s.add_argument("--plan", help="architect's plan; makes sign-off mandatory before integrate")
+    s.add_argument("--signoff", action="store_true", help="require architect sign-off (risky change)")
+    s.add_argument("--base", default="HEAD"); s.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_MIN)
+    s.set_defaults(fn=cmd_start)
+    s = sub.add_parser("fix")
+    s.add_argument("task"); s.add_argument("--feedback", required=True)
+    s.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_MIN)
+    s.set_defaults(fn=cmd_fix)
+    s = sub.add_parser("round"); s.add_argument("task"); s.set_defaults(fn=cmd_round)
+    s = sub.add_parser("takeover")
+    s.add_argument("task"); s.add_argument("--reason", required=True)
+    s.set_defaults(fn=cmd_takeover)
+    s = sub.add_parser("verify")
+    s.add_argument("task"); s.add_argument("--timeout", type=int, default=30)
+    s.add_argument("--allow-test-changes", action="store_true",
+                   help="accept acceptance tests that changed since they were seeded")
+    verify_command = s.add_argument("command", nargs=argparse.REMAINDER)
+    s.set_defaults(fn=cmd_verify)
+    s = sub.add_parser("package"); s.add_argument("task"); s.set_defaults(fn=cmd_package)
+    s = sub.add_parser("signoff"); s.add_argument("task")
+    s.add_argument("--verdict", required=True); s.add_argument("--file", required=True)
+    s.set_defaults(fn=cmd_signoff)
+    s = sub.add_parser("integrate"); s.add_argument("task"); s.set_defaults(fn=cmd_integrate)
+    sub.add_parser("stats").set_defaults(fn=cmd_stats)
+    s = sub.add_parser("status"); s.add_argument("task", nargs="?"); s.set_defaults(fn=cmd_status)
+    s = sub.add_parser("cleanup"); s.add_argument("task"); s.add_argument("--force", action="store_true")
+    s.set_defaults(fn=cmd_cleanup)
+    argv, test_command = sys.argv[1:], None
+    if argv[:1] == ["verify"] and "--" in argv:
+        # Everything after `--` is the test command; our own options may sit on either side of <task>.
+        cut = argv.index("--")
+        argv, test_command = argv[:cut], argv[cut + 1:]
+        verify_command.nargs = "*"
+    a = ap.parse_args(argv)
+    if test_command is not None:
+        a.command = test_command
+    try:
+        try:
+            a.fn(a)
+        finally:
+            note_session(a)
+    except Fail as e:
+        print(f"\ndelegate: {e}", file=sys.stderr)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()
