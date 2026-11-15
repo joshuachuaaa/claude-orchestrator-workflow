@@ -233,3 +233,7 @@ This is new. The script has been exercised end to end against scratch
 repositories with a stand-in typist, but the skill and its two subagents have
 not yet been measured on real tasks, so no claim is made here about cost or
 quality against a single model.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
